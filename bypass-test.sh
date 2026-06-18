@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Captive Portal Bypass Test Suite
-#  Version: 2.3  |  Date: 2026-06-18
+#  Version: 2.4  |  Date: 2026-06-18
 #
 #  PURPOSE: Verify that captive portal bypass defenses are
 #           working correctly on any MikroTik hotspot or WISP.
@@ -198,34 +198,48 @@ install_tools() {
 
   case "$PLATFORM" in
     debian)
+      # Debian/Ubuntu: package names match check_tool() calls directly
       $SUDO apt-get update -qq
       for pkg in "${MISSING_TOOLS[@]}"; do
         $SUDO apt-get install -y -qq "$pkg" && log "Installed: $pkg" || warn "Failed to install: $pkg"
       done
       ;;
     fedora|rhel)
+      # Fedora/RHEL: several packages have different names from Debian
       for pkg in "${MISSING_TOOLS[@]}"; do
-        $SUDO "$PKG_MGR" install -y -q "$pkg" && log "Installed: $pkg" || warn "Failed to install: $pkg"
+        local rpkg="$pkg"
+        [[ "$pkg" == "iputils-ping"   ]] && rpkg="iputils"
+        [[ "$pkg" == "dnsutils"       ]] && rpkg="bind-utils"
+        [[ "$pkg" == "iproute2"       ]] && rpkg="iproute"
+        [[ "$pkg" == "knot-dnsutils"  ]] && rpkg="knot-utils"
+        [[ "$pkg" == "netcat-openbsd" ]] && rpkg="nmap-ncat"
+        $SUDO "$PKG_MGR" install -y -q "$rpkg" && log "Installed: $rpkg" || warn "Failed to install: $rpkg"
       done
       ;;
     termux)
+      # Termux: different names + some tools unavailable (no kernel access)
       pkg update -y -q 2>/dev/null
       for pkg in "${MISSING_TOOLS[@]}"; do
-        # Termux package names differ slightly
         local tpkg="$pkg"
-        [[ "$pkg" == "dnsutils" ]] && tpkg="dnsutils"
-        [[ "$pkg" == "knot-dnsutils" ]] && tpkg="knot-utils"
-        [[ "$pkg" == "iodine" ]] && tpkg="iodine"
-        [[ "$pkg" == "hping3" ]] && tpkg="hping3"
-        [[ "$pkg" == "nmap" ]] && tpkg="nmap"
+        [[ "$pkg" == "iputils-ping"   ]] && tpkg="inetutils"
+        [[ "$pkg" == "knot-dnsutils"  ]] && tpkg="knot-utils"
+        [[ "$pkg" == "netcat-openbsd" ]] && tpkg="netcat"
+        [[ "$pkg" == "python3"        ]] && tpkg="python"
+        [[ "$pkg" == "hping3"         ]] && { warn "hping3 unavailable on Termux — TEST 9 will fall back to nmap"; continue; }
+        [[ "$pkg" == "iodine"         ]] && { warn "iodine unavailable on Termux — TEST 6 will be skipped"; continue; }
         pkg install -y "$tpkg" 2>/dev/null && log "Installed: $tpkg" || warn "Not available in Termux: $tpkg"
       done
       ;;
     macos)
+      # macOS: ping and nc are pre-installed; some tools have different Homebrew names
       for pkg in "${MISSING_TOOLS[@]}"; do
         local mpkg="$pkg"
-        [[ "$pkg" == "dnsutils" ]] && mpkg="bind"
-        [[ "$pkg" == "knot-dnsutils" ]] && mpkg="knot-dns"
+        [[ "$pkg" == "iputils-ping"   ]] && { log "ping is pre-installed on macOS — skipping"; continue; }
+        [[ "$pkg" == "netcat-openbsd" ]] && { log "nc is pre-installed on macOS — skipping"; continue; }
+        [[ "$pkg" == "dnsutils"       ]] && mpkg="bind"
+        [[ "$pkg" == "knot-dnsutils"  ]] && mpkg="knot-dns"
+        [[ "$pkg" == "iproute2"       ]] && mpkg="iproute2mac"
+        [[ "$pkg" == "hping3"         ]] && mpkg="hping"
         brew install "$mpkg" && log "Installed: $mpkg" || warn "Failed to install: $mpkg"
       done
       ;;
@@ -1019,7 +1033,7 @@ main() {
   clear
   echo ""
   echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.3      ║${NC}"
+  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.4      ║${NC}"
   echo -e "${BOLD}${BLUE}  ║   Connect to hotspot (unauthenticated) first  ║${NC}"
   echo -e "${BOLD}${BLUE}  ╚══════════════════════════════════════════════╝${NC}"
   echo ""
