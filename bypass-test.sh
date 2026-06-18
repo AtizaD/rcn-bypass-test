@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Captive Portal Bypass Test Suite
-#  Version: 2.5  |  Date: 2026-06-18
+#  Version: 2.6  |  Date: 2026-06-18
 #
 #  PURPOSE: Verify that captive portal bypass defenses are
 #           working correctly on any MikroTik hotspot or WISP.
@@ -976,16 +976,53 @@ print('REACHABLE:' + ','.join(reachable) if reachable else 'BLOCKED')
 check_tools() {
   header "Checking Required Tools"
 
-  check_tool "curl"    "curl"
-  check_tool "ping"    "iputils-ping"
-  check_tool "dig"     "dnsutils"
-  check_tool "ip"      "iproute2"
-  check_tool "kdig"    "knot-dnsutils"   || true
-  check_tool "iodine"  "iodine"          || true
-  check_tool "nc"      "netcat-openbsd"  || true
-  check_tool "python3" "python3"         || true
-  check_tool "hping3"  "hping3"          || true
-  check_tool "nmap"    "nmap"            || true
+  # ── Always required ──────────────────────────────────────────
+  check_tool "curl" "curl"
+  check_tool "dig"  "dnsutils"
+
+  # ── ping: pre-installed on macOS; via inetutils on Termux ───
+  if [ "$PLATFORM" = "macos" ]; then
+    command -v ping &>/dev/null && ok "ping pre-installed" || warn "ping not found on macOS"
+  else
+    check_tool "ping" "iputils-ping" || true
+  fi
+
+  # ── ip: not native on macOS (iproute2mac optional) ──────────
+  if [ "$PLATFORM" != "macos" ]; then
+    check_tool "ip" "iproute2" || true
+  fi
+
+  # ── nc: pre-installed on macOS ───────────────────────────────
+  if [ "$PLATFORM" != "macos" ]; then
+    check_tool "nc" "netcat-openbsd" || true
+  fi
+
+  # ── python: 'python3' on Linux/macOS, 'python' on Termux ────
+  if [ "$PLATFORM" = "termux" ]; then
+    check_tool "python" "python" || true
+  else
+    check_tool "python3" "python3" || true
+  fi
+
+  # ── kdig for DoT test ────────────────────────────────────────
+  check_tool "kdig" "knot-dnsutils" || true
+
+  # ── nmap: available on all platforms including Termux ────────
+  check_tool "nmap" "nmap" || true
+
+  # ── hping3: NOT in Termux repos — skip entirely, use nmap fallback
+  if [ "$PLATFORM" = "termux" ]; then
+    warn "hping3 not in Termux repos — TEST 9 will use nmap fallback"
+  else
+    check_tool "hping3" "hping3" || true
+  fi
+
+  # ── iodine: NOT in Termux repos — skip entirely
+  if [ "$PLATFORM" = "termux" ]; then
+    warn "iodine not in Termux repos — TEST 6 will be skipped"
+  else
+    check_tool "iodine" "iodine" || true
+  fi
 
   install_tools
 }
@@ -1084,7 +1121,7 @@ main() {
   clear
   echo ""
   echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.5      ║${NC}"
+  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.6      ║${NC}"
   echo -e "${BOLD}${BLUE}  ║   Connect to hotspot (unauthenticated) first  ║${NC}"
   echo -e "${BOLD}${BLUE}  ╚══════════════════════════════════════════════╝${NC}"
   echo ""
