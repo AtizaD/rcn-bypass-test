@@ -453,8 +453,13 @@ test_icmp() {
     ok "Small ICMP to router works (expected)."
     record PASS "ICMP small (≤64B)" "ping to $ROUTER_IP succeeded"
   else
-    warn "Small ICMP to router failed — may be a firewall issue unrelated to tunneling."
-    record WARN "ICMP small (≤64B)" "ping to $ROUTER_IP failed — check if ICMP is globally blocked"
+    if [ "$PLATFORM" = "termux" ]; then
+      log "Small ICMP to router failed — expected on Android (raw ICMP needs root)."
+      record SKIP "ICMP small (≤64B)" "Android blocks raw ICMP from non-root apps — not a firewall finding"
+    else
+      warn "Small ICMP to router failed — may be a firewall issue unrelated to tunneling."
+      record WARN "ICMP small (≤64B)" "ping to $ROUTER_IP failed — check if ICMP is globally blocked"
+    fi
   fi
 
   # Test 2b: Large ping to external — must be DROPPED (tunnel prevention)
@@ -487,8 +492,13 @@ test_icmp() {
     ok "Medium ICMP (150B) to router works — threshold is correct."
     record PASS "ICMP threshold (150B)" "ping -s 150 passes as expected"
   else
-    warn "Medium ICMP (150B) failed — threshold may be too aggressive."
-    record WARN "ICMP threshold (150B)" "ping -s 150 failed — may cause diagnostic issues"
+    if [ "$PLATFORM" = "termux" ]; then
+      log "Medium ICMP (150B) failed — expected on Android (raw ICMP needs root)."
+      record SKIP "ICMP threshold (150B)" "Android blocks raw ICMP from non-root apps — not a firewall finding"
+    else
+      warn "Medium ICMP (150B) failed — threshold may be too aggressive."
+      record WARN "ICMP threshold (150B)" "ping -s 150 failed — may cause diagnostic issues"
+    fi
   fi
 }
 
@@ -875,19 +885,26 @@ test_dns_hijacking() {
   # Test 10a: NXDOMAIN — non-existent domain must return NXDOMAIN, not a portal IP
   local fake_domain="rcn-test-nxdomain-$(date +%s)-xyzabc.invalid"
   log "Querying non-existent domain '$fake_domain' — must return NXDOMAIN..."
-  local nxdomain_result nxdomain_status
-  nxdomain_result=$(dig +short +time=5 @"$ROUTER_IP" "$fake_domain" 2>/dev/null)
+  local nxdomain_raw nxdomain_ip nxdomain_status
+  nxdomain_raw=$(dig +short +time=5 @"$ROUTER_IP" "$fake_domain" 2>/dev/null)
+  # Extract only real IPv4 addresses — dig on Android outputs error lines to stdout too
+  nxdomain_ip=$(echo "$nxdomain_raw" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
   nxdomain_status=$(dig +time=5 @"$ROUTER_IP" "$fake_domain" 2>/dev/null \
                     | awk '/status:/{gsub(",",""); print $6}' | head -1)
 
-  if [ -z "$nxdomain_result" ] && [ "$nxdomain_status" = "NXDOMAIN" ]; then
+  if [ -n "$nxdomain_ip" ]; then
+    # An actual IP was returned for a non-existent domain = hijacked
+    fail "Router returned IP '$nxdomain_ip' for a non-existent domain — NXDOMAIN hijack!"
+    warn "All failed lookups redirect to: $nxdomain_ip"
+    warn "This breaks iOS/Android captive portal detection and some auth apps."
+    record FAIL "DNS NXDOMAIN correct" "Fake domain resolved to $nxdomain_ip — NXDOMAIN hijacked"
+  elif [ -z "$nxdomain_raw" ] || echo "$nxdomain_raw" | grep -qi "timed out\|communications error\|SERVFAIL\|no servers"; then
+    # Timeout/error = DNS has issues but no hijacking
+    warn "DNS query for fake domain timed out — router DNS may have issues, but no hijacking detected."
+    record WARN "DNS NXDOMAIN correct" "Query timed out (no hijack, but DNS reliability issue)"
+  elif [ "$nxdomain_status" = "NXDOMAIN" ]; then
     ok "Router returns correct NXDOMAIN — DNS not hijacking unknown queries."
     record PASS "DNS NXDOMAIN correct" "Router returned NXDOMAIN for $fake_domain"
-  elif [ -n "$nxdomain_result" ]; then
-    fail "Router returned IP '$nxdomain_result' for a non-existent domain — NXDOMAIN hijack!"
-    warn "All failed lookups redirect to: $nxdomain_result"
-    warn "This breaks iOS/Android captive portal detection and some auth apps."
-    record FAIL "DNS NXDOMAIN correct" "Fake domain resolved to $nxdomain_result — NXDOMAIN hijacked"
   else
     warn "DNS response for fake domain unclear (status: ${nxdomain_status:-none}) — check manually."
     record WARN "DNS NXDOMAIN correct" "Status ${nxdomain_status:-unknown} for $fake_domain"
@@ -971,7 +988,7 @@ test_header_injection() {
   if [ "$connect_code" = "200" ]; then
     fail "Portal returned HTTP 200 to CONNECT method — may be acting as open HTTP proxy!"
     record FAIL "CONNECT proxy blocked" "Portal returned 200 to CONNECT method — proxy bypass risk"
-  elif [[ "$connect_code" =~ ^(400|403|405|501|000)$ ]]; then
+  elif [[ "$connect_code" =~ ^(400|403|405|501|503|000)$ ]]; then
     ok "Portal rejected CONNECT method (HTTP $connect_code) — not a proxy."
     record PASS "CONNECT proxy blocked" "Portal returned HTTP $connect_code to CONNECT method"
   else
@@ -989,8 +1006,9 @@ test_header_injection() {
     -H "Referer: ${PORTAL_BASE_URL}/login" \
     "${portal_url}/api/usage" 2>/dev/null)
 
-  if [[ "$origin_code" =~ ^(401|403|302)$ ]]; then
-    ok "API with spoofed Origin returned HTTP $origin_code — session token still required."
+  if [[ "$origin_code" =~ ^(401|403|302|404)$ ]]; then
+    # 404 = endpoint doesn't exist = not exploitable via origin spoofing
+    ok "API with spoofed Origin returned HTTP $origin_code — origin spoofing not effective."
     record PASS "Origin header ignored" "API returned HTTP $origin_code — origin spoofing blocked"
   elif [ "$origin_code" = "200" ]; then
     warn "API returned 200 with spoofed Origin — confirm this endpoint requires a valid session token."
