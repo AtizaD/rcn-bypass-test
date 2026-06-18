@@ -36,6 +36,8 @@ EXTERNAL_IP="8.8.8.8"                                 # IP that should be unreac
 EXTERNAL_HOST="google.com"
 DNS_TUNNEL_SANDBOX="sandbox.iodine.kryo.se"           # public iodine test server
 ROUTER_IP="192.168.88.1"                              # hotspot gateway (auto-detected at runtime)
+PORTAL_BASE_URL=""                                    # set in preflight() after gateway detection
+PORTAL_CURL_RESOLVE=""                                # --resolve flags for .local mDNS domains
 TIMEOUT=8                                              # seconds per test
 IODINE_TIMEOUT=20                                      # iodine handshake timeout
 
@@ -348,6 +350,17 @@ preflight() {
     warn "Could not auto-detect gateway, using default: $ROUTER_IP"
   fi
 
+  # Set portal URL scheme and resolve options.
+  # .local mDNS domains have no SSL cert and can't be resolved via DNS —
+  # use http:// and tell curl to connect via the router IP directly.
+  if [[ "$PORTAL_DOMAIN" == *".local" ]]; then
+    PORTAL_BASE_URL="http://${PORTAL_DOMAIN}"
+    PORTAL_CURL_RESOLVE="--resolve ${PORTAL_DOMAIN}:80:${ROUTER_IP} --resolve ${PORTAL_DOMAIN}:443:${ROUTER_IP} --resolve www.${PORTAL_DOMAIN}:80:${ROUTER_IP} --resolve www.${PORTAL_DOMAIN}:443:${ROUTER_IP}"
+  else
+    PORTAL_BASE_URL="https://${PORTAL_DOMAIN}"
+    PORTAL_CURL_RESOLVE=""
+  fi
+
   # Verify we are NOT already authenticated (internet should be blocked)
   log "Checking that internet is blocked (pre-auth state)..."
   if curl -s --max-time 5 --head "https://${EXTERNAL_IP}" &>/dev/null; then
@@ -367,7 +380,8 @@ preflight() {
 
   # Check if portal is reachable (walled garden sanity)
   log "Checking portal is reachable..."
-  if curl -s --max-time 8 --head "https://${PORTAL_DOMAIN}" &>/dev/null; then
+  # shellcheck disable=SC2086
+  if curl -s --max-time 8 $PORTAL_CURL_RESOLVE --head "${PORTAL_BASE_URL}" &>/dev/null; then
     ok "Portal domain reachable: ${PORTAL_DOMAIN}"
     record PASS "Portal reachable" "${PORTAL_DOMAIN} accessible in walled garden"
   else
@@ -703,9 +717,13 @@ test_portal_integrity() {
   local slugs=("${PORTAL_DOMAIN}" "www.${PORTAL_DOMAIN}")
 
   for domain in "${slugs[@]}"; do
-    log "Testing portal access: https://${domain}..."
+    local scheme="https"
+    [[ "$domain" == *".local" ]] && scheme="http"
+    log "Testing portal access: ${scheme}://${domain}..."
     local http_code
-    http_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" "https://${domain}" 2>/dev/null)
+    # shellcheck disable=SC2086
+    http_code=$(curl -s --max-time "$TIMEOUT" $PORTAL_CURL_RESOLVE \
+      -o /dev/null -w "%{http_code}" "${scheme}://${domain}" 2>/dev/null)
     if [[ "$http_code" =~ ^(200|301|302|307|308)$ ]]; then
       ok "Portal ${domain} → HTTP ${http_code} (accessible)."
       record PASS "Portal integrity" "${domain} returned HTTP ${http_code}"
@@ -875,14 +893,17 @@ test_dns_hijacking() {
 test_header_injection() {
   header "TEST 11 — HTTP Header Injection (Portal Identity Bypass)"
 
-  local portal_url="https://${PORTAL_DOMAIN}"
+  local portal_url="${PORTAL_BASE_URL}"
 
   # Test 11a: X-Forwarded-For spoofing — portal must return same content regardless
   log "Testing X-Forwarded-For / X-Real-IP spoofing..."
   local normal_code spoofed_code
-  normal_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" \
-    "$portal_url" 2>/dev/null)
-  spoofed_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" \
+  # shellcheck disable=SC2086
+  normal_code=$(curl -s --max-time "$TIMEOUT" $PORTAL_CURL_RESOLVE \
+    -o /dev/null -w "%{http_code}" "$portal_url" 2>/dev/null)
+  # shellcheck disable=SC2086
+  spoofed_code=$(curl -s --max-time "$TIMEOUT" $PORTAL_CURL_RESOLVE \
+    -o /dev/null -w "%{http_code}" \
     -H "X-Forwarded-For: 127.0.0.1" \
     -H "X-Real-IP: 127.0.0.1" \
     -H "X-Originating-IP: 127.0.0.1" \
@@ -901,7 +922,9 @@ test_header_injection() {
   # Test 11b: HTTP CONNECT method — portal must NOT act as a forward proxy
   log "Testing HTTP CONNECT method (portal must not proxy external requests)..."
   local connect_code
-  connect_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" \
+  # shellcheck disable=SC2086
+  connect_code=$(curl -s --max-time "$TIMEOUT" $PORTAL_CURL_RESOLVE \
+    -o /dev/null -w "%{http_code}" \
     -X CONNECT \
     -H "Host: google.com:443" \
     "$portal_url" 2>/dev/null)
@@ -920,9 +943,11 @@ test_header_injection() {
   # Test 11c: Spoofed Origin / Referer — check portal isn't doing naive origin checks
   log "Testing spoofed Origin header (portal must validate sessions, not headers)..."
   local origin_code
-  origin_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" \
-    -H "Origin: https://${PORTAL_DOMAIN}" \
-    -H "Referer: https://${PORTAL_DOMAIN}/login" \
+  # shellcheck disable=SC2086
+  origin_code=$(curl -s --max-time "$TIMEOUT" $PORTAL_CURL_RESOLVE \
+    -o /dev/null -w "%{http_code}" \
+    -H "Origin: ${PORTAL_BASE_URL}" \
+    -H "Referer: ${PORTAL_BASE_URL}/login" \
     "${portal_url}/api/usage" 2>/dev/null)
 
   if [[ "$origin_code" =~ ^(401|403|302)$ ]]; then
