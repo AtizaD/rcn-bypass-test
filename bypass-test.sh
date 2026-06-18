@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Captive Portal Bypass Test Suite
-#  Version: 2.2  |  Date: 2026-06-18
+#  Version: 2.3  |  Date: 2026-06-18
 #
 #  PURPOSE: Verify that captive portal bypass defenses are
 #           working correctly on any MikroTik hotspot or WISP.
@@ -29,7 +29,7 @@ RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[1;34m'; CYAN='\033[0;36m';  BOLD='\033[1m'; NC='\033[0m'
 
 # ── Config ───────────────────────────────────────────────────
-PORTAL_DOMAIN="${PORTAL_DOMAIN:-rcnetworks.xyz}"      # your captive portal domain
+PORTAL_DOMAIN="${PORTAL_DOMAIN:-}"                    # auto-detected if not set via env
 PAYMENT_DOMAIN="${PAYMENT_DOMAIN:-api.paystack.co}"   # payment gateway that must be pre-auth accessible
 TELEMETRY_URL="${TELEMETRY_URL:-}"                     # optional: POST audit results here on failure
 EXTERNAL_IP="8.8.8.8"                                 # IP that should be unreachable pre-auth
@@ -84,6 +84,88 @@ detect_platform() {
     PLATFORM="unknown"; PKG_MGR=""; SUDO="sudo"
   fi
   log "Platform: ${PLATFORM} | Package manager: ${PKG_MGR:-none detected}"
+}
+
+# ── Portal auto-detection ─────────────────────────────────────
+detect_portal_domain() {
+  if [ -n "$PORTAL_DOMAIN" ]; then
+    log "Portal domain (manual): ${PORTAL_DOMAIN}"
+    return 0
+  fi
+
+  log "Auto-detecting captive portal domain..."
+
+  # Strategy 1: follow HTTP redirect on standard captive-portal probe URLs.
+  # When unauthenticated, the router redirects these to the portal login page.
+  local probes=(
+    "http://connectivitycheck.gstatic.com/generate_204"   # Android probe
+    "http://captive.apple.com/hotspot-detect.html"         # iOS/macOS probe
+    "http://neverssl.com/"                                  # always plain HTTP
+    "http://example.com/"                                   # neutral fallback
+  )
+
+  local probe probe_host final_url final_host
+  for probe in "${probes[@]}"; do
+    probe_host=$(echo "$probe" | sed 's|http://||' | cut -d'/' -f1)
+    final_url=$(curl -sk --max-time 8 -L --max-redirs 10 \
+      -o /dev/null -w "%{url_effective}" "$probe" 2>/dev/null)
+    final_host=$(echo "$final_url" | sed 's|https\?://||' | cut -d'/' -f1 | cut -d':' -f1)
+
+    # Accept if: final host differs from probe host AND is not a well-known non-portal host
+    if [ -n "$final_host" ] && [ "$final_host" != "$probe_host" ] && \
+       [[ "$final_host" != *"google"* ]] && [[ "$final_host" != *"apple"* ]] && \
+       [[ "$final_host" != *"microsoft"* ]] && [[ "$final_host" != *"neverssl"* ]] && \
+       [[ "$final_host" != *"example"* ]] && [[ "$final_host" != *"msft"* ]]; then
+      PORTAL_DOMAIN="$final_host"
+      ok "Portal auto-detected: ${BOLD}${PORTAL_DOMAIN}${NC}"
+      log "  (redirect: ${probe} → ${final_url})"
+      return 0
+    fi
+  done
+
+  # Strategy 2: check if the gateway itself redirects to a portal domain
+  if [ -n "$ROUTER_IP" ]; then
+    local gw_url gw_host
+    gw_url=$(curl -sk --max-time 5 -L --max-redirs 5 \
+      -o /dev/null -w "%{url_effective}" "http://${ROUTER_IP}/" 2>/dev/null)
+    gw_host=$(echo "$gw_url" | sed 's|https\?://||' | cut -d'/' -f1 | cut -d':' -f1)
+    if [ -n "$gw_host" ] && [ "$gw_host" != "$ROUTER_IP" ] && echo "$gw_host" | grep -q '\.'; then
+      PORTAL_DOMAIN="$gw_host"
+      ok "Portal detected via gateway redirect: ${BOLD}${PORTAL_DOMAIN}${NC}"
+      return 0
+    fi
+  fi
+
+  # Strategy 3: check DNS hijacking — if a blocked domain resolves to a non-standard IP,
+  # that IP is likely the portal. Try a reverse lookup to get its hostname.
+  if command -v dig &>/dev/null; then
+    local hijacked_ip hijacked_host
+    hijacked_ip=$(dig +short +time=4 "this-should-not-exist-$(date +%s).com" 2>/dev/null | head -1)
+    if echo "$hijacked_ip" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+      hijacked_host=$(dig +short +time=4 -x "$hijacked_ip" 2>/dev/null | head -1 | sed 's/\.$//')
+      if [ -n "$hijacked_host" ]; then
+        PORTAL_DOMAIN="$hijacked_host"
+        ok "Portal detected via DNS hijack hostname: ${BOLD}${PORTAL_DOMAIN}${NC}"
+        return 0
+      else
+        PORTAL_DOMAIN="$hijacked_ip"
+        ok "Portal detected via DNS hijack IP: ${BOLD}${PORTAL_DOMAIN}${NC}"
+        return 0
+      fi
+    fi
+  fi
+
+  # Fallback: ask the operator
+  echo ""
+  warn "Could not auto-detect portal domain."
+  echo -ne "  Enter portal domain [leave blank to skip portal tests]: "
+  read -r _input
+  PORTAL_DOMAIN="${_input:-}"
+  if [ -n "$PORTAL_DOMAIN" ]; then
+    log "Using portal domain: ${PORTAL_DOMAIN}"
+  else
+    warn "No portal domain set — portal integrity tests will be skipped."
+  fi
 }
 
 is_root() { [ "$(id -u)" -eq 0 ]; }
@@ -937,17 +1019,19 @@ main() {
   clear
   echo ""
   echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.2      ║${NC}"
+  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.3      ║${NC}"
   echo -e "${BOLD}${BLUE}  ║   Connect to hotspot (unauthenticated) first  ║${NC}"
   echo -e "${BOLD}${BLUE}  ╚══════════════════════════════════════════════╝${NC}"
   echo ""
-  echo -e "  Portal:  ${CYAN}${PORTAL_DOMAIN}${NC}"
   echo -e "  Payment: ${CYAN}${PAYMENT_DOMAIN}${NC}"
   echo -e "  Target:  ${CYAN}${EXTERNAL_IP}${NC}"
   echo -e "  Date:    ${CYAN}$(date)${NC}"
   echo ""
 
   detect_platform
+  detect_portal_domain
+  echo -e "  Portal:  ${CYAN}${PORTAL_DOMAIN:-not detected}${NC}"
+  echo ""
   check_tools
   preflight
   test_ipv6
