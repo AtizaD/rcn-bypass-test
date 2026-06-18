@@ -311,20 +311,40 @@ install_tools() {
 preflight() {
   header "Pre-flight Checks"
 
-  # Check we have a gateway (connected to something)
-  if ! ip route &>/dev/null 2>&1 && ! route -n &>/dev/null 2>&1; then
-    fail "No network interface found. Are you connected to WiFi?"
-    exit 1
+  # Detect gateway IP using all available methods (order: Linux → Termux/Android → macOS → proc)
+  local gw=""
+  # Method 1: iproute2 (standard Linux)
+  gw=$(ip route show default 2>/dev/null | awk '/default/{print $3; exit}')
+  # Method 2: ip route get (works on Termux even without a default route entry)
+  [ -z "$gw" ] && gw=$(ip route get 8.8.8.8 2>/dev/null | awk '/via/{for(i=1;i<=NF;i++) if($i=="via") {print $(i+1); exit}}')
+  # Method 3: macOS
+  [ -z "$gw" ] && gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
+  # Method 4: Android system properties (Termux)
+  if [ -z "$gw" ] && command -v getprop &>/dev/null; then
+    for iface in wlan0 wlan1 eth0 rmnet0; do
+      gw=$(getprop "dhcp.${iface}.gateway" 2>/dev/null)
+      [ -n "$gw" ] && break
+    done
+  fi
+  # Method 5: parse /proc/net/route (hex gateway, little-endian)
+  if [ -z "$gw" ] && [ -f /proc/net/route ]; then
+    local hex
+    hex=$(awk 'NR>1 && $2=="00000000" && $3!="00000000" {print $3; exit}' /proc/net/route 2>/dev/null)
+    if [ -n "$hex" ]; then
+      gw=$(printf "%d.%d.%d.%d" \
+        "0x${hex:6:2}" "0x${hex:4:2}" "0x${hex:2:2}" "0x${hex:0:2}" 2>/dev/null)
+    fi
   fi
 
-  # Try to detect the router IP (Linux: ip route; macOS: route -n get default)
-  local gw
-  gw=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
-  [ -z "$gw" ] && gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
   if [ -n "$gw" ]; then
     ROUTER_IP="$gw"
     log "Gateway detected: $ROUTER_IP"
   else
+    # Last resort: check if curl can reach anything at all
+    if ! curl -s --max-time 4 --head "http://${ROUTER_IP}/" &>/dev/null; then
+      fail "No network interface found. Are you connected to WiFi?"
+      exit 1
+    fi
     warn "Could not auto-detect gateway, using default: $ROUTER_IP"
   fi
 
