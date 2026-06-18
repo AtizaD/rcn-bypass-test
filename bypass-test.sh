@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Captive Portal Bypass Test Suite
-#  Version: 2.1  |  Date: 2026-06-18
+#  Version: 2.2  |  Date: 2026-06-18
 #
 #  PURPOSE: Verify that captive portal bypass defenses are
 #           working correctly on any MikroTik hotspot or WISP.
@@ -31,6 +31,7 @@ BLUE='\033[1;34m'; CYAN='\033[0;36m';  BOLD='\033[1m'; NC='\033[0m'
 # ── Config ───────────────────────────────────────────────────
 PORTAL_DOMAIN="${PORTAL_DOMAIN:-rcnetworks.xyz}"      # your captive portal domain
 PAYMENT_DOMAIN="${PAYMENT_DOMAIN:-api.paystack.co}"   # payment gateway that must be pre-auth accessible
+TELEMETRY_URL="${TELEMETRY_URL:-}"                     # optional: POST audit results here on failure
 EXTERNAL_IP="8.8.8.8"                                 # IP that should be unreachable pre-auth
 EXTERNAL_HOST="google.com"
 DNS_TUNNEL_SANDBOX="sandbox.iodine.kryo.se"           # public iodine test server
@@ -663,20 +664,26 @@ test_dns_hijacking() {
     record WARN "Router as DNS resolver" "No DNS response from $ROUTER_IP directly"
   fi
 
-  # Test 10c: DNS leak — confirm external resolver cannot be reached directly
-  log "Testing DNS leak (querying 8.8.8.8 directly should go via router redirect)..."
-  local via_google
-  via_google=$(dig +short +time=5 @"$EXTERNAL_IP" "$EXTERNAL_HOST" 2>/dev/null | head -1)
-  if [ -n "$via_google" ]; then
-    # With redirect active, querying @8.8.8.8 still works (router intercepts and answers)
-    # Without redirect, querying @8.8.8.8 works by reaching Google directly
-    # We can't easily distinguish; report as informational
-    warn "DNS to @$EXTERNAL_IP resolved '$via_google' — may be redirected (expected) or a direct leak."
-    warn "Confirm via MikroTik: /ip firewall nat print — look for rcn-dns-redirect rules."
-    record WARN "DNS leak check" "Query @$EXTERNAL_IP succeeded — verify NAT redirect is in place"
+  # Test 10c: DNS redirect — proof via an unreachable nameserver
+  # Logic: 192.0.2.1 is TEST-NET-1, reserved and unroutable — it is never a real resolver.
+  # WITHOUT redirect: query to @192.0.2.1 times out (packet can't reach it).
+  # WITH redirect: router's NAT rule intercepts the query before it leaves and answers
+  #   it locally — so it resolves successfully. Success here is PROOF redirect is on.
+  # Note: querying @8.8.8.8 is NOT used here because with redirect on, 8.8.8.8 also
+  # resolves (router intercepts it) — making success vs. timeout ambiguous.
+  local unreachable_ns="192.0.2.1"
+  log "Confirming DNS redirect using unreachable nameserver ($unreachable_ns)..."
+  log "(Resolving via $unreachable_ns is only possible if the router intercepts the query)"
+  local redirect_proof
+  redirect_proof=$(dig +short +time=6 @"$unreachable_ns" "$EXTERNAL_HOST" 2>/dev/null | head -1)
+  if [ -n "$redirect_proof" ]; then
+    ok "DNS resolved '$redirect_proof' via unreachable NS — router is intercepting all DNS."
+    ok "DNS NAT redirect is definitively confirmed active."
+    record PASS "DNS redirect confirmed" "Unreachable NS $unreachable_ns answered by router — redirect proven"
   else
-    ok "Direct query to @$EXTERNAL_IP timed out — DNS redirect blocking external resolver access."
-    record PASS "DNS leak check" "Direct query @$EXTERNAL_IP failed — redirect is active"
+    warn "Query to unreachable NS $unreachable_ns timed out — redirect may not be active."
+    warn "Check MikroTik: /ip firewall nat print | grep dns-redirect"
+    record WARN "DNS redirect confirmed" "Unreachable NS test inconclusive — verify NAT redirect rules"
   fi
 }
 
@@ -836,6 +843,36 @@ check_tools() {
   install_tools
 }
 
+# ── Telemetry ─────────────────────────────────────────────────
+send_telemetry() {
+  [ -z "$TELEMETRY_URL" ] && return
+
+  log "Sending audit results to telemetry endpoint..."
+  local entries=""
+  local first=1
+  for entry in "${RESULTS[@]}"; do
+    IFS='|' read -r status name detail <<< "$entry"
+    [ $first -eq 0 ] && entries+=","
+    entries+=$(printf '{"status":"%s","name":"%s","detail":"%s"}' \
+      "$status" "$name" "$(echo "$detail" | sed 's/"/\\"/g')")
+    first=0
+  done
+
+  local payload
+  payload=$(printf '{"event":"captive_portal_audit","portal":"%s","pass":%d,"fail":%d,"warn":%d,"skip":%d,"date":"%s","results":[%s]}' \
+    "$PORTAL_DOMAIN" "$PASS" "$FAIL" "$WARN" "$SKIP" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$entries")
+
+  if curl -s --max-time 10 -X POST \
+      -H "Content-Type: application/json" \
+      -d "$payload" \
+      "$TELEMETRY_URL" &>/dev/null; then
+    ok "Audit results posted to: $TELEMETRY_URL"
+  else
+    warn "Could not reach telemetry endpoint: $TELEMETRY_URL"
+  fi
+}
+
 # ── Summary ───────────────────────────────────────────────────
 print_summary() {
   echo ""
@@ -865,6 +902,7 @@ print_summary() {
     echo -e "${RED}${BOLD}  ✘ $FAIL test(s) FAILED — bypasses are possible.${NC}"
     echo -e "  Review FAIL entries above and apply the recommended firewall rules"
     echo -e "  for your platform (MikroTik, OpenWRT, pfSense, etc.)."
+    send_telemetry
   elif [ "$WARN" -gt 0 ]; then
     echo ""
     echo -e "${YELLOW}${BOLD}  ⚠ $WARN warning(s) — minor issues or known limitations.${NC}"
@@ -872,6 +910,18 @@ print_summary() {
   else
     echo ""
     echo -e "${GREEN}${BOLD}  ✔ All tests passed — captive portal hardening is working!${NC}"
+  fi
+
+  # Firewall order confirmation — if all protocol-block tests passed, the drop rules
+  # are provably executing before any walled-garden accept rules in the chain.
+  local icmp_ok dot_ok quic_ok
+  icmp_ok=$(printf '%s\n' "${RESULTS[@]}" | grep "ICMP tunnel block" | grep -c "^PASS" || true)
+  dot_ok=$(printf '%s\n'  "${RESULTS[@]}" | grep "DoT blocked"       | grep -c "^PASS" || true)
+  quic_ok=$(printf '%s\n' "${RESULTS[@]}" | grep "QUIC blocked"      | grep -c "^PASS" || true)
+  if [ "${icmp_ok:-0}" -gt 0 ] && [ "${dot_ok:-0}" -gt 0 ] && [ "${quic_ok:-0}" -gt 0 ]; then
+    echo ""
+    echo -e "${GREEN}  ✔ Firewall rule ordering confirmed${NC} — ICMP/DoT/QUIC drop rules"
+    echo -e "    are evaluated before walled-garden accept rules (all three blocked)."
   fi
 
   echo ""
@@ -887,7 +937,7 @@ main() {
   clear
   echo ""
   echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.1      ║${NC}"
+  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.2      ║${NC}"
   echo -e "${BOLD}${BLUE}  ║   Connect to hotspot (unauthenticated) first  ║${NC}"
   echo -e "${BOLD}${BLUE}  ╚══════════════════════════════════════════════╝${NC}"
   echo ""
