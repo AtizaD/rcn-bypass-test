@@ -38,6 +38,7 @@ DNS_TUNNEL_SANDBOX="sandbox.iodine.kryo.se"           # public iodine test serve
 ROUTER_IP="192.168.88.1"                              # hotspot gateway (auto-detected at runtime)
 PORTAL_BASE_URL=""                                    # set in preflight() after gateway detection
 PORTAL_CURL_RESOLVE=""                                # --resolve flags for .local mDNS domains
+PORTAL_ON_CLOUDFLARE=0                                # set in preflight() — 1 if portal is CF-hosted
 TIMEOUT=8                                              # seconds per test
 IODINE_TIMEOUT=20                                      # iodine handshake timeout
 
@@ -361,6 +362,23 @@ preflight() {
     PORTAL_CURL_RESOLVE=""
   fi
 
+  # Detect if portal is hosted on Cloudflare (check for cf-ray or server: cloudflare headers)
+  if [ -n "$PORTAL_DOMAIN" ] && [[ "$PORTAL_DOMAIN" != *".local" ]]; then
+    local cf_headers
+    # shellcheck disable=SC2086
+    cf_headers=$(curl -s --max-time 6 $PORTAL_CURL_RESOLVE -I "${PORTAL_BASE_URL}" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if echo "$cf_headers" | grep -q "cf-ray:\|server: cloudflare"; then
+      PORTAL_ON_CLOUDFLARE=1
+      log "Portal is Cloudflare-hosted — CF walled garden tests will run."
+    else
+      PORTAL_ON_CLOUDFLARE=0
+      log "Portal is NOT on Cloudflare — CF-specific tests will be skipped."
+    fi
+  else
+    PORTAL_ON_CLOUDFLARE=0
+    log "Portal is NOT on Cloudflare (.local domain) — CF-specific tests will be skipped."
+  fi
+
   # Verify we are NOT already authenticated (internet should be blocked)
   log "Checking that internet is blocked (pre-auth state)..."
   if curl -s --max-time 5 --head "https://${EXTERNAL_IP}" &>/dev/null; then
@@ -672,40 +690,61 @@ test_dns_tunnel() {
   fi
 }
 
-# ── TEST 7: Cloudflare Walled Garden Scope ────────────────────
+# ── TEST 7: Walled Garden Scope ───────────────────────────────
 test_cf_walled_garden() {
-  header "TEST 7 — Cloudflare Walled Garden Scope"
+  if [ "$PORTAL_ON_CLOUDFLARE" -eq 1 ]; then
+    header "TEST 7 — Cloudflare Walled Garden Scope"
+    log "Portal is Cloudflare-hosted — running CF-specific walled garden checks."
 
-  log "Testing that a random Cloudflare-hosted site is NOT freely accessible..."
-
-  # Cloudflare Pages / Workers — attacker could host a proxy here
-  # This should be accessible (TCP 443) but NOT tunnelable beyond HTTP
-  # We test if raw non-HTTP traffic on port 443 gets through
-
-  local cf_test_domain="cloudflare-eth.com"  # Cloudflare-hosted, not our portal
-
-  if curl -s --max-time "$TIMEOUT" --head "https://${cf_test_domain}" &>/dev/null; then
-    warn "Cloudflare-hosted site ${cf_test_domain} is accessible (TCP 443)."
-    warn "This is EXPECTED — we only block non-HTTP protocols on CF IPs."
-    warn "A determined attacker could still use WebSocket over HTTPS as a proxy."
-    warn "This is a known limitation of Cloudflare-based portal architecture."
-    record WARN "CF walled garden scope" "${cf_test_domain} accessible via TCP 443 — WebSocket bypass theoretically possible"
-  else
-    ok "${cf_test_domain} not accessible — walled garden is very tight."
-    record PASS "CF walled garden scope" "${cf_test_domain} not reachable pre-auth"
-  fi
-
-  # Test that non-HTTP CF traffic is blocked (e.g., a raw TCP connection on non-80/443 port)
-  if command -v nc &>/dev/null; then
-    log "Testing that non-standard ports to Cloudflare IPs are blocked..."
-    local cf_ip="104.16.1.1"  # Known Cloudflare IP
-    if nc -z -w 5 "$cf_ip" 8080 &>/dev/null 2>&1; then
-      fail "Port 8080 to Cloudflare IP $cf_ip is reachable — walled garden not port-restricted!"
-      record FAIL "CF port restriction" "TCP 8080 to $cf_ip accessible — only 80/443 should be allowed"
+    # CF Pages/Workers could be used as a WebSocket proxy by an attacker
+    local cf_test_domain="cloudflare-eth.com"
+    log "Testing that a random Cloudflare-hosted site is NOT freely accessible..."
+    if curl -s --max-time "$TIMEOUT" --head "https://${cf_test_domain}" &>/dev/null; then
+      warn "Cloudflare-hosted site ${cf_test_domain} is accessible (TCP 443)."
+      warn "This is EXPECTED — only non-HTTP protocols on CF IPs can be blocked."
+      warn "A determined attacker could still use WebSocket over HTTPS as a tunnel."
+      warn "This is a known limitation of Cloudflare-based portal architecture."
+      record WARN "CF walled garden scope" "${cf_test_domain} accessible via TCP 443 — WebSocket bypass theoretically possible"
     else
-      ok "Non-standard port (8080) to Cloudflare IP blocked."
-      record PASS "CF port restriction" "TCP 8080 to CF IP $cf_ip blocked"
+      ok "${cf_test_domain} not accessible — walled garden is very tight."
+      record PASS "CF walled garden scope" "${cf_test_domain} not reachable pre-auth"
     fi
+
+    # Non-standard ports to CF IPs should be blocked
+    if command -v nc &>/dev/null; then
+      log "Testing that non-standard ports to Cloudflare IPs are blocked..."
+      local cf_ip="104.16.1.1"
+      if nc -z -w 5 "$cf_ip" 8080 &>/dev/null 2>&1; then
+        fail "Port 8080 to Cloudflare IP $cf_ip is reachable — walled garden not port-restricted!"
+        record FAIL "CF port restriction" "TCP 8080 to $cf_ip accessible — only 80/443 should be allowed to CF IPs"
+      else
+        ok "Non-standard port (8080) to Cloudflare IP blocked."
+        record PASS "CF port restriction" "TCP 8080 to CF IP $cf_ip blocked"
+      fi
+    fi
+
+  else
+    header "TEST 7 — Walled Garden Scope"
+    log "Portal is NOT on Cloudflare — running generic walled garden scope check."
+
+    # Generic test: a random internet site should NOT be reachable pre-auth
+    local test_sites=("example.com" "wikipedia.org" "github.com")
+    local accessible=0
+    for site in "${test_sites[@]}"; do
+      if curl -s --max-time 5 --head "https://${site}" &>/dev/null; then
+        fail "https://${site} is reachable pre-auth — walled garden may be too open!"
+        record FAIL "Walled garden scope" "${site} accessible pre-auth — internet not fully blocked"
+        accessible=1
+        break
+      fi
+    done
+    if [ "$accessible" -eq 0 ]; then
+      ok "Random internet sites blocked — walled garden scope is correct."
+      record PASS "Walled garden scope" "Tested sites unreachable pre-auth"
+    fi
+
+    record SKIP "CF port restriction" "Portal not on Cloudflare — not applicable"
+    record SKIP "CF walled garden scope" "Portal not on Cloudflare — not applicable"
   fi
 }
 
@@ -1170,11 +1209,13 @@ print_summary() {
     echo -e "    are evaluated before walled-garden accept rules (all three blocked)."
   fi
 
-  echo ""
-  echo -e "${BOLD}  Known unfixable limitation:${NC}"
-  echo -e "  WebSocket proxy over HTTPS (port 443) via any Cloudflare-hosted"
-  echo -e "  site remains theoretically possible. Mitigated by: rate-limiting,"
-  echo -e "  the need for a Cloudflare account, and slow tunnel throughput."
+  if [ "$PORTAL_ON_CLOUDFLARE" -eq 1 ]; then
+    echo ""
+    echo -e "${BOLD}  Known unfixable limitation (Cloudflare-hosted portal):${NC}"
+    echo -e "  WebSocket proxy over HTTPS (port 443) via any Cloudflare-hosted"
+    echo -e "  site remains theoretically possible. Mitigated by: rate-limiting,"
+    echo -e "  the need for a Cloudflare account, and slow tunnel throughput."
+  fi
   echo ""
 }
 
