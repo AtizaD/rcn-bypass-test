@@ -104,12 +104,22 @@ detect_portal_domain() {
     "http://example.com/"                                   # neutral fallback
   )
 
-  local probe probe_host final_url final_host
+  local probe probe_host redirect_url final_url final_host
   for probe in "${probes[@]}"; do
     probe_host=$(echo "$probe" | sed 's|http://||' | cut -d'/' -f1)
-    final_url=$(curl -sk --max-time 8 -L --max-redirs 10 \
-      -o /dev/null -w "%{url_effective}" "$probe" 2>/dev/null)
-    final_host=$(echo "$final_url" | sed 's|https\?://||' | cut -d'/' -f1 | cut -d':' -f1)
+
+    # Primary: read Location header WITHOUT following it — works for .local mDNS domains
+    # that curl can't resolve via DNS (e.g. basscafe.local, portal.local)
+    redirect_url=$(curl -s --max-time 8 --max-redirs 0 \
+      -o /dev/null -w "%{redirect_url}" "$probe" 2>/dev/null)
+    final_host=$(echo "$redirect_url" | sed 's|https\?://||' | cut -d'/' -f1 | cut -d':' -f1)
+
+    # Fallback: follow redirects for multi-hop portals with resolvable domains
+    if [ -z "$final_host" ] || [ "$final_host" = "$probe_host" ]; then
+      final_url=$(curl -sk --max-time 8 -L --max-redirs 10 \
+        -o /dev/null -w "%{url_effective}" "$probe" 2>/dev/null)
+      final_host=$(echo "$final_url" | sed 's|https\?://||' | cut -d'/' -f1 | cut -d':' -f1)
+    fi
 
     # Accept if: final host differs from probe host AND is not a well-known non-portal host
     if [ -n "$final_host" ] && [ "$final_host" != "$probe_host" ] && \
@@ -118,17 +128,24 @@ detect_portal_domain() {
        [[ "$final_host" != *"example"* ]] && [[ "$final_host" != *"msft"* ]]; then
       PORTAL_DOMAIN="$final_host"
       ok "Portal auto-detected: ${BOLD}${PORTAL_DOMAIN}${NC}"
-      log "  (redirect: ${probe} → ${final_url})"
+      log "  (redirect: ${probe} → ${redirect_url:-$final_url})"
       return 0
     fi
   done
 
   # Strategy 2: check if the gateway itself redirects to a portal domain
   if [ -n "$ROUTER_IP" ]; then
-    local gw_url gw_host
-    gw_url=$(curl -sk --max-time 5 -L --max-redirs 5 \
-      -o /dev/null -w "%{url_effective}" "http://${ROUTER_IP}/" 2>/dev/null)
-    gw_host=$(echo "$gw_url" | sed 's|https\?://||' | cut -d'/' -f1 | cut -d':' -f1)
+    local gw_redirect gw_url gw_host
+    # Try Location header first (catches .local domains)
+    gw_redirect=$(curl -s --max-time 5 --max-redirs 0 \
+      -o /dev/null -w "%{redirect_url}" "http://${ROUTER_IP}/" 2>/dev/null)
+    gw_host=$(echo "$gw_redirect" | sed 's|https\?://||' | cut -d'/' -f1 | cut -d':' -f1)
+    # Fallback: follow redirects
+    if [ -z "$gw_host" ] || [ "$gw_host" = "$ROUTER_IP" ]; then
+      gw_url=$(curl -sk --max-time 5 -L --max-redirs 5 \
+        -o /dev/null -w "%{url_effective}" "http://${ROUTER_IP}/" 2>/dev/null)
+      gw_host=$(echo "$gw_url" | sed 's|https\?://||' | cut -d'/' -f1 | cut -d':' -f1)
+    fi
     if [ -n "$gw_host" ] && [ "$gw_host" != "$ROUTER_IP" ] && echo "$gw_host" | grep -q '\.'; then
       PORTAL_DOMAIN="$gw_host"
       ok "Portal detected via gateway redirect: ${BOLD}${PORTAL_DOMAIN}${NC}"
