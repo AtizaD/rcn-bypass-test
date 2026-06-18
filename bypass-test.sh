@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Captive Portal Bypass Test Suite
-#  Version: 2.4  |  Date: 2026-06-18
+#  Version: 2.5  |  Date: 2026-06-18
 #
 #  PURPOSE: Verify that captive portal bypass defenses are
 #           working correctly on any MikroTik hotspot or WISP.
@@ -171,6 +171,47 @@ detect_portal_domain() {
 is_root() { [ "$(id -u)" -eq 0 ]; }
 can_sudo() { command -v sudo &>/dev/null && sudo -n true 2>/dev/null; }
 
+# ── Platform command variants ─────────────────────────────────
+# Called after install_tools so newly-installed binaries are visible.
+setup_commands() {
+  # python: 'python3' on most platforms, 'python' on Termux
+  if command -v python3 &>/dev/null; then
+    PYTHON_CMD="python3"
+  elif command -v python &>/dev/null; then
+    PYTHON_CMD="python"
+  else
+    PYTHON_CMD=""
+  fi
+
+  # hping: 'hping3' on Linux/Termux, 'hping' on macOS (brew install hping)
+  if command -v hping3 &>/dev/null; then
+    HPING_CMD="hping3"
+  elif command -v hping &>/dev/null; then
+    HPING_CMD="hping"
+  else
+    HPING_CMD=""
+  fi
+
+  # timeout: built-in on Linux; macOS needs 'gtimeout' from brew install coreutils
+  if command -v timeout &>/dev/null; then
+    TIMEOUT_CMD="timeout"
+  elif command -v gtimeout &>/dev/null; then
+    TIMEOUT_CMD="gtimeout"
+  else
+    TIMEOUT_CMD=""
+  fi
+
+  # ping -W: Linux/Termux interpret as seconds; macOS interprets as milliseconds
+  # macOS uses -t for a seconds-based wait instead
+  if [ "$PLATFORM" = "macos" ]; then
+    PING_WAIT="-t"
+  else
+    PING_WAIT="-W"
+  fi
+
+  log "Tools: python=${PYTHON_CMD:-none} | hping=${HPING_CMD:-none} | timeout=${TIMEOUT_CMD:-none} | ping_wait=${PING_WAIT}"
+}
+
 # ── Tool installation ─────────────────────────────────────────
 MISSING_TOOLS=()
 
@@ -259,9 +300,10 @@ preflight() {
     exit 1
   fi
 
-  # Try to detect the router IP
+  # Try to detect the router IP (Linux: ip route; macOS: route -n get default)
   local gw
   gw=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+  [ -z "$gw" ] && gw=$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')
   if [ -n "$gw" ]; then
     ROUTER_IP="$gw"
     log "Gateway detected: $ROUTER_IP"
@@ -303,8 +345,13 @@ test_ipv6() {
   log "Checking if IPv6 is disabled on the router..."
 
   # Check if we got an IPv6 address (other than link-local fe80::)
+  # macOS: 'ip -6' not available — use ifconfig instead
   local ipv6_global
-  ipv6_global=$(ip -6 addr show 2>/dev/null | grep "inet6" | grep -v " fe80" | grep -v " ::1" | head -1)
+  if [ "$PLATFORM" = "macos" ]; then
+    ipv6_global=$(ifconfig 2>/dev/null | grep "inet6" | grep -v " fe80" | grep -v " ::1" | head -1)
+  else
+    ipv6_global=$(ip -6 addr show 2>/dev/null | grep "inet6" | grep -v " fe80" | grep -v " ::1" | head -1)
+  fi
 
   if [ -n "$ipv6_global" ]; then
     fail "Device has a global IPv6 address: $ipv6_global"
@@ -333,7 +380,7 @@ test_icmp() {
 
   # Test 2a: Small ping — must work (walled garden / router reachable)
   log "Testing small ICMP (≤64 bytes) — should succeed to router..."
-  if ping -c 2 -W 3 "$ROUTER_IP" &>/dev/null 2>&1; then
+  if ping -c 2 $PING_WAIT 3 "$ROUTER_IP" &>/dev/null 2>&1; then
     ok "Small ICMP to router works (expected)."
     record PASS "ICMP small (≤64B)" "ping to $ROUTER_IP succeeded"
   else
@@ -347,12 +394,12 @@ test_icmp() {
 
   if is_root || can_sudo; then
     # Linux: -s sets data size (500 bytes data + 28 header = 528 bytes total)
-    if ${SUDO} ping -c 2 -W "$TIMEOUT" -s 500 "$EXTERNAL_IP" &>/dev/null 2>&1; then
+    if ${SUDO} ping -c 2 $PING_WAIT "$TIMEOUT" -s 500 "$EXTERNAL_IP" &>/dev/null 2>&1; then
       large_result=1
     fi
   else
     # Try without sudo (works on most modern Linux and macOS)
-    if ping -c 2 -W "$TIMEOUT" -s 500 "$EXTERNAL_IP" &>/dev/null 2>&1; then
+    if ping -c 2 $PING_WAIT "$TIMEOUT" -s 500 "$EXTERNAL_IP" &>/dev/null 2>&1; then
       large_result=1
     fi
   fi
@@ -367,7 +414,7 @@ test_icmp() {
 
   # Test 2c: Medium ping (150 bytes) — below our 200 threshold, should work
   log "Testing medium ICMP (150 bytes) — should succeed (below 200-byte block threshold)..."
-  if ping -c 2 -W 5 -s 150 "$ROUTER_IP" &>/dev/null 2>&1; then
+  if ping -c 2 $PING_WAIT 5 -s 150 "$ROUTER_IP" &>/dev/null 2>&1; then
     ok "Medium ICMP (150B) to router works — threshold is correct."
     record PASS "ICMP threshold (150B)" "ping -s 150 passes as expected"
   else
@@ -414,10 +461,10 @@ test_quic() {
   fi
 
   # Method B: Python UDP test (checks if UDP 443 packets get out)
-  if command -v python3 &>/dev/null; then
+  if [ -n "$PYTHON_CMD" ]; then
     log "Testing QUIC via Python UDP probe (UDP 443 to $EXTERNAL_IP)..."
     local py_result
-    py_result=$(python3 -c "
+    py_result=$($PYTHON_CMD -c "
 import socket, time
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 s.settimeout(5)
@@ -454,7 +501,7 @@ finally:
     return
   fi
 
-  skip "No HTTP/3-capable curl, python3, or nc available — skipping QUIC test."
+  skip "No HTTP/3-capable curl, python, or nc available — skipping QUIC test."
   record SKIP "QUIC blocked (UDP 443)" "No suitable tool available"
 }
 
@@ -535,7 +582,7 @@ test_dns_tunnel() {
   local iodine_log
   iodine_log=$(mktemp /tmp/iodine_test.XXXXXX)
 
-  ${SUDO} timeout "$IODINE_TIMEOUT" iodine -f -r -P autodie \
+  ${SUDO} ${TIMEOUT_CMD:-timeout} "$IODINE_TIMEOUT" iodine -f -r -P autodie \
     "$DNS_TUNNEL_SANDBOX" > "$iodine_log" 2>&1 &
   local iodine_pid=$!
 
@@ -566,8 +613,12 @@ test_dns_tunnel() {
     record WARN "DNS tunnel (iodine)" "Inconclusive result — check manually"
   fi
 
-  # Cleanup: remove tun device if iodine created one
-  ${SUDO} ip link delete dns0 2>/dev/null || true
+  # Cleanup: remove tun device if iodine created one (ip on Linux, ifconfig on macOS)
+  if [ "$PLATFORM" = "macos" ]; then
+    ${SUDO} ifconfig dns0 down 2>/dev/null || true
+  else
+    ${SUDO} ip link delete dns0 2>/dev/null || true
+  fi
 }
 
 # ── TEST 7: Cloudflare Walled Garden Scope ────────────────────
@@ -644,8 +695,8 @@ test_stateful_firewall() {
   header "TEST 9 — Stateful Firewall (TCP State Confusion)"
   log "Checking that stray ACK/RST packets can't bypass the firewall..."
 
-  if ! command -v hping3 &>/dev/null && ! command -v nmap &>/dev/null; then
-    skip "hping3 and nmap not installed — skipping stateful firewall test."
+  if [ -z "$HPING_CMD" ] && ! command -v nmap &>/dev/null; then
+    skip "hping3/hping and nmap not installed — skipping stateful firewall test."
     record SKIP "Stateful firewall" "hping3/nmap not available"
     return
   fi
@@ -656,27 +707,27 @@ test_stateful_firewall() {
     return
   fi
 
-  # ── Method A: hping3 (most accurate) ────────────────────────
-  if command -v hping3 &>/dev/null; then
+  # ── Method A: hping3/hping (most accurate) ──────────────────
+  if [ -n "$HPING_CMD" ]; then
 
     # SYN: new connection to internet — must be blocked
-    log "hping3 SYN → $EXTERNAL_IP:443 (new connection — must be BLOCKED)..."
+    log "$HPING_CMD SYN → $EXTERNAL_IP:443 (new connection — must be BLOCKED)..."
     local syn_log; syn_log=$(mktemp /tmp/hping3_syn.XXXXXX)
-    ${SUDO} timeout 8 hping3 -c 3 -S -p 443 -n "$EXTERNAL_IP" > "$syn_log" 2>&1 || true
+    ${SUDO} ${TIMEOUT_CMD:-timeout} 8 $HPING_CMD -c 3 -S -p 443 -n "$EXTERNAL_IP" > "$syn_log" 2>&1 || true
     local syn_out; syn_out=$(cat "$syn_log"); rm -f "$syn_log"
 
     if echo "$syn_out" | grep -qi "flags=SA"; then
       fail "TCP SYN got SYN-ACK from $EXTERNAL_IP:443 — internet is reachable without auth!"
-      record FAIL "TCP SYN blocked" "hping3 SYN got SA reply — internet reachable"
+      record FAIL "TCP SYN blocked" "$HPING_CMD SYN got SA reply — internet reachable"
     else
       ok "TCP SYN dropped — new connections to internet are blocked."
       record PASS "TCP SYN blocked" "No SYN-ACK received from $EXTERNAL_IP:443"
     fi
 
     # ACK: spoofed "established" session — should ALSO be blocked
-    log "hping3 ACK → $EXTERNAL_IP:443 (spoofed established — must also be BLOCKED)..."
+    log "$HPING_CMD ACK → $EXTERNAL_IP:443 (spoofed established — must also be BLOCKED)..."
     local ack_log; ack_log=$(mktemp /tmp/hping3_ack.XXXXXX)
-    ${SUDO} timeout 8 hping3 -c 3 -A -p 443 -n "$EXTERNAL_IP" > "$ack_log" 2>&1 || true
+    ${SUDO} ${TIMEOUT_CMD:-timeout} 8 $HPING_CMD -c 3 -A -p 443 -n "$EXTERNAL_IP" > "$ack_log" 2>&1 || true
     local ack_out; ack_out=$(cat "$ack_log"); rm -f "$ack_log"
 
     if echo "$ack_out" | grep -qi "flags=RA\|flags=R\b"; then
@@ -733,7 +784,7 @@ test_dns_hijacking() {
   local nxdomain_result nxdomain_status
   nxdomain_result=$(dig +short +time=5 @"$ROUTER_IP" "$fake_domain" 2>/dev/null)
   nxdomain_status=$(dig +time=5 @"$ROUTER_IP" "$fake_domain" 2>/dev/null \
-                    | grep -oP 'status: \K\w+' | head -1)
+                    | awk '/status:/{gsub(",",""); print $6}' | head -1)
 
   if [ -z "$nxdomain_result" ] && [ "$nxdomain_status" = "NXDOMAIN" ]; then
     ok "Router returns correct NXDOMAIN — DNS not hijacking unknown queries."
@@ -855,10 +906,10 @@ test_ntp_bypass() {
   log "NTP (UDP 123) should only reach the router's own clock — not the full internet..."
 
   # ── Method A: Python (most reliable) ────────────────────────
-  if command -v python3 &>/dev/null; then
+  if [ -n "$PYTHON_CMD" ]; then
     log "Sending real NTP client requests to external time servers..."
     local ntp_result
-    ntp_result=$(python3 -c "
+    ntp_result=$($PYTHON_CMD -c "
 import socket
 
 ntp_msg = b'\\x1b' + b'\\x00' * 47  # NTP mode 3 (client) request
@@ -1033,7 +1084,7 @@ main() {
   clear
   echo ""
   echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.4      ║${NC}"
+  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.5      ║${NC}"
   echo -e "${BOLD}${BLUE}  ║   Connect to hotspot (unauthenticated) first  ║${NC}"
   echo -e "${BOLD}${BLUE}  ╚══════════════════════════════════════════════╝${NC}"
   echo ""
@@ -1047,6 +1098,7 @@ main() {
   echo -e "  Portal:  ${CYAN}${PORTAL_DOMAIN:-not detected}${NC}"
   echo ""
   check_tools
+  setup_commands
   preflight
   test_ipv6
   test_icmp
