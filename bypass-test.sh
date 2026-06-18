@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # ============================================================
-#  RuralConnect — Captive Portal Bypass Test Suite
-#  Version: 2.0  |  Date: 2026-06-18
+#  Captive Portal Bypass Test Suite
+#  Version: 2.1  |  Date: 2026-06-18
 #
-#  PURPOSE: Verify that all captive portal bypass defenses are
-#           working correctly on a deployed RuralConnect router.
+#  PURPOSE: Verify that captive portal bypass defenses are
+#           working correctly on any MikroTik hotspot or WISP.
+#           Compatible with RuralConnect, Zenfii, OpenWRT
+#           Nodogsplash, MikroTik HotSpot, and others.
 #
 #  HOW TO USE:
 #    1. Connect a device to the hotspot WiFi
@@ -12,8 +14,13 @@
 #    3. Run:  bash bypass-test.sh
 #    4. Review the PASS/FAIL summary at the end
 #
+#  OVERRIDE DEFAULTS (env vars):
+#    PORTAL_DOMAIN=yourportal.com bash bypass-test.sh
+#    PAYMENT_DOMAIN=api.stripe.com bash bypass-test.sh
+#    ROUTER_IP=10.0.0.1 bash bypass-test.sh
+#
 #  PLATFORMS: Linux, Termux (Android), macOS
-#  NOTE:      Some tests require root/sudo (iodine, raw ICMP).
+#  NOTE:      Some tests require root/sudo (iodine, hping3).
 #             On Termux, run without sudo.
 # ============================================================
 
@@ -22,11 +29,12 @@ RED='\033[0;31m';  GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[1;34m'; CYAN='\033[0;36m';  BOLD='\033[1m'; NC='\033[0m'
 
 # ── Config ───────────────────────────────────────────────────
-PORTAL_DOMAIN="${PORTAL_DOMAIN:-rcnetworks.xyz}"      # override with env if needed
+PORTAL_DOMAIN="${PORTAL_DOMAIN:-rcnetworks.xyz}"      # your captive portal domain
+PAYMENT_DOMAIN="${PAYMENT_DOMAIN:-api.paystack.co}"   # payment gateway that must be pre-auth accessible
 EXTERNAL_IP="8.8.8.8"                                 # IP that should be unreachable pre-auth
 EXTERNAL_HOST="google.com"
 DNS_TUNNEL_SANDBOX="sandbox.iodine.kryo.se"           # public iodine test server
-ROUTER_IP="192.168.88.1"                              # default RuralConnect hotspot gateway
+ROUTER_IP="192.168.88.1"                              # hotspot gateway (auto-detected at runtime)
 TIMEOUT=8                                              # seconds per test
 IODINE_TIMEOUT=20                                      # iodine handshake timeout
 
@@ -522,14 +530,15 @@ test_portal_integrity() {
     fi
   done
 
-  # Paystack (payment gateway) must be reachable pre-auth
-  log "Testing Paystack payment gateway (must be in walled garden)..."
-  if curl -s --max-time "$TIMEOUT" --head "https://api.paystack.co" &>/dev/null; then
-    ok "Paystack API reachable — payment walled garden intact."
-    record PASS "Paystack walled garden" "api.paystack.co accessible pre-auth"
+  # Payment gateway must be reachable pre-auth (customers need to pay before getting a voucher)
+  log "Testing payment gateway walled garden: ${PAYMENT_DOMAIN}..."
+  log "(Override with: PAYMENT_DOMAIN=api.stripe.com bash bypass-test.sh)"
+  if curl -s --max-time "$TIMEOUT" --head "https://${PAYMENT_DOMAIN}" &>/dev/null; then
+    ok "Payment gateway reachable: ${PAYMENT_DOMAIN} — walled garden intact."
+    record PASS "Payment gateway walled garden" "${PAYMENT_DOMAIN} accessible pre-auth"
   else
-    warn "Paystack not reachable — customers may not be able to pay before voucher entry."
-    record WARN "Paystack walled garden" "api.paystack.co unreachable pre-auth"
+    warn "${PAYMENT_DOMAIN} not reachable — customers may not be able to pay before auth."
+    record WARN "Payment gateway walled garden" "${PAYMENT_DOMAIN} unreachable pre-auth"
   fi
 }
 
@@ -854,8 +863,8 @@ print_summary() {
   if [ "$FAIL" -gt 0 ]; then
     echo ""
     echo -e "${RED}${BOLD}  ✘ $FAIL test(s) FAILED — bypasses are possible.${NC}"
-    echo -e "  Review FAIL entries above and check router scripts version."
-    echo -e "  Routers must be on scripts v52+ for full hardening."
+    echo -e "  Review FAIL entries above and apply the recommended firewall rules"
+    echo -e "  for your platform (MikroTik, OpenWRT, pfSense, etc.)."
   elif [ "$WARN" -gt 0 ]; then
     echo ""
     echo -e "${YELLOW}${BOLD}  ⚠ $WARN warning(s) — minor issues or known limitations.${NC}"
@@ -878,13 +887,14 @@ main() {
   clear
   echo ""
   echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${BLUE}  ║   RuralConnect Bypass Test Suite v2.0        ║${NC}"
+  echo -e "${BOLD}${BLUE}  ║   Captive Portal Bypass Test Suite v2.1      ║${NC}"
   echo -e "${BOLD}${BLUE}  ║   Connect to hotspot (unauthenticated) first  ║${NC}"
   echo -e "${BOLD}${BLUE}  ╚══════════════════════════════════════════════╝${NC}"
   echo ""
-  echo -e "  Portal: ${CYAN}${PORTAL_DOMAIN}${NC}"
-  echo -e "  Target: ${CYAN}${EXTERNAL_IP}${NC}"
-  echo -e "  Date:   ${CYAN}$(date)${NC}"
+  echo -e "  Portal:  ${CYAN}${PORTAL_DOMAIN}${NC}"
+  echo -e "  Payment: ${CYAN}${PAYMENT_DOMAIN}${NC}"
+  echo -e "  Target:  ${CYAN}${EXTERNAL_IP}${NC}"
+  echo -e "  Date:    ${CYAN}$(date)${NC}"
   echo ""
 
   detect_platform
