@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
 #  RuralConnect — Captive Portal Bypass Test Suite
-#  Version: 1.0  |  Date: 2026-06-18
+#  Version: 2.0  |  Date: 2026-06-18
 #
 #  PURPOSE: Verify that all captive portal bypass defenses are
 #           working correctly on a deployed RuralConnect router.
@@ -125,6 +125,8 @@ install_tools() {
         [[ "$pkg" == "dnsutils" ]] && tpkg="dnsutils"
         [[ "$pkg" == "knot-dnsutils" ]] && tpkg="knot-utils"
         [[ "$pkg" == "iodine" ]] && tpkg="iodine"
+        [[ "$pkg" == "hping3" ]] && tpkg="hping3"
+        [[ "$pkg" == "nmap" ]] && tpkg="nmap"
         pkg install -y "$tpkg" 2>/dev/null && log "Installed: $tpkg" || warn "Not available in Termux: $tpkg"
       done
       ;;
@@ -531,6 +533,282 @@ test_portal_integrity() {
   fi
 }
 
+# ── TEST 9: Stateful Firewall ─────────────────────────────────
+test_stateful_firewall() {
+  header "TEST 9 — Stateful Firewall (TCP State Confusion)"
+  log "Checking that stray ACK/RST packets can't bypass the firewall..."
+
+  if ! command -v hping3 &>/dev/null && ! command -v nmap &>/dev/null; then
+    skip "hping3 and nmap not installed — skipping stateful firewall test."
+    record SKIP "Stateful firewall" "hping3/nmap not available"
+    return
+  fi
+
+  if ! is_root && ! can_sudo; then
+    skip "Stateful firewall test requires root/sudo — skipping."
+    record SKIP "Stateful firewall" "Root required but not available"
+    return
+  fi
+
+  # ── Method A: hping3 (most accurate) ────────────────────────
+  if command -v hping3 &>/dev/null; then
+
+    # SYN: new connection to internet — must be blocked
+    log "hping3 SYN → $EXTERNAL_IP:443 (new connection — must be BLOCKED)..."
+    local syn_log; syn_log=$(mktemp /tmp/hping3_syn.XXXXXX)
+    ${SUDO} timeout 8 hping3 -c 3 -S -p 443 -n "$EXTERNAL_IP" > "$syn_log" 2>&1 || true
+    local syn_out; syn_out=$(cat "$syn_log"); rm -f "$syn_log"
+
+    if echo "$syn_out" | grep -qi "flags=SA"; then
+      fail "TCP SYN got SYN-ACK from $EXTERNAL_IP:443 — internet is reachable without auth!"
+      record FAIL "TCP SYN blocked" "hping3 SYN got SA reply — internet reachable"
+    else
+      ok "TCP SYN dropped — new connections to internet are blocked."
+      record PASS "TCP SYN blocked" "No SYN-ACK received from $EXTERNAL_IP:443"
+    fi
+
+    # ACK: spoofed "established" session — should ALSO be blocked
+    log "hping3 ACK → $EXTERNAL_IP:443 (spoofed established — must also be BLOCKED)..."
+    local ack_log; ack_log=$(mktemp /tmp/hping3_ack.XXXXXX)
+    ${SUDO} timeout 8 hping3 -c 3 -A -p 443 -n "$EXTERNAL_IP" > "$ack_log" 2>&1 || true
+    local ack_out; ack_out=$(cat "$ack_log"); rm -f "$ack_log"
+
+    if echo "$ack_out" | grep -qi "flags=RA\|flags=R\b"; then
+      # RST back from router means it was blocked at the router — good
+      ok "TCP ACK got RST — router blocked stray ACK (stateful firewall working)."
+      record PASS "Stateful firewall (ACK)" "Stray ACK to $EXTERNAL_IP:443 → RST from router"
+    elif echo "$ack_out" | grep -qi "100% packet loss\|timeout"; then
+      ok "TCP ACK silently dropped — stateful firewall is blocking stray packets."
+      record PASS "Stateful firewall (ACK)" "Stray ACK to $EXTERNAL_IP:443 dropped"
+    elif echo "$ack_out" | grep -qi "flags=SA\|flags=A"; then
+      fail "TCP ACK got a real response from $EXTERNAL_IP — stray packets routed through!"
+      fail "Firewall is NOT checking connection state — established/related trap exists."
+      record FAIL "Stateful firewall (ACK)" "Stray ACK to $EXTERNAL_IP:443 received response — state bypass possible"
+    else
+      warn "TCP ACK result inconclusive — check MikroTik connection-tracking rules manually."
+      record WARN "Stateful firewall (ACK)" "hping3 ACK output inconclusive"
+    fi
+    return
+  fi
+
+  # ── Method B: nmap ACK scan (fallback) ──────────────────────
+  if command -v nmap &>/dev/null; then
+    log "nmap ACK scan → $EXTERNAL_IP:443 (checking if stateful rules are in place)..."
+    local nmap_out
+    nmap_out=$(${SUDO} nmap -n --scanflags ACK -p 443 --host-timeout 12s "$EXTERNAL_IP" 2>/dev/null \
+               | grep "443/tcp" || true)
+
+    if echo "$nmap_out" | grep -q "unfiltered"; then
+      fail "nmap: port 443 shows 'unfiltered' for ACK scan — stray TCP ACK getting through!"
+      record FAIL "Stateful firewall (ACK)" "nmap ACK scan: $EXTERNAL_IP:443 unfiltered"
+    elif echo "$nmap_out" | grep -q "filtered"; then
+      ok "nmap: port 443 'filtered' — stateful firewall blocking stray ACK packets."
+      record PASS "Stateful firewall (ACK)" "nmap ACK scan: $EXTERNAL_IP:443 filtered"
+    else
+      warn "nmap ACK scan result: '${nmap_out:-no output}' — inconclusive."
+      record WARN "Stateful firewall (ACK)" "nmap ACK scan inconclusive: ${nmap_out:-no output}"
+    fi
+  fi
+}
+
+# ── TEST 10: DNS Hijacking ────────────────────────────────────
+test_dns_hijacking() {
+  header "TEST 10 — DNS Hijacking & Leak Verification"
+
+  if ! command -v dig &>/dev/null; then
+    skip "dig not installed — skipping DNS hijacking test."
+    record SKIP "DNS hijacking check" "dig not available"
+    return
+  fi
+
+  # Test 10a: NXDOMAIN — non-existent domain must return NXDOMAIN, not a portal IP
+  local fake_domain="rcn-test-nxdomain-$(date +%s)-xyzabc.invalid"
+  log "Querying non-existent domain '$fake_domain' — must return NXDOMAIN..."
+  local nxdomain_result nxdomain_status
+  nxdomain_result=$(dig +short +time=5 @"$ROUTER_IP" "$fake_domain" 2>/dev/null)
+  nxdomain_status=$(dig +time=5 @"$ROUTER_IP" "$fake_domain" 2>/dev/null \
+                    | grep -oP 'status: \K\w+' | head -1)
+
+  if [ -z "$nxdomain_result" ] && [ "$nxdomain_status" = "NXDOMAIN" ]; then
+    ok "Router returns correct NXDOMAIN — DNS not hijacking unknown queries."
+    record PASS "DNS NXDOMAIN correct" "Router returned NXDOMAIN for $fake_domain"
+  elif [ -n "$nxdomain_result" ]; then
+    fail "Router returned IP '$nxdomain_result' for a non-existent domain — NXDOMAIN hijack!"
+    warn "All failed lookups redirect to: $nxdomain_result"
+    warn "This breaks iOS/Android captive portal detection and some auth apps."
+    record FAIL "DNS NXDOMAIN correct" "Fake domain resolved to $nxdomain_result — NXDOMAIN hijacked"
+  else
+    warn "DNS response for fake domain unclear (status: ${nxdomain_status:-none}) — check manually."
+    record WARN "DNS NXDOMAIN correct" "Status ${nxdomain_status:-unknown} for $fake_domain"
+  fi
+
+  # Test 10b: Verify router answers as resolver (not just transparent passthrough)
+  log "Verifying router $ROUTER_IP responds to DNS queries directly..."
+  local direct_answer
+  direct_answer=$(dig +short +time=5 @"$ROUTER_IP" "$EXTERNAL_HOST" 2>/dev/null | head -1)
+  if [ -n "$direct_answer" ]; then
+    ok "Router at $ROUTER_IP answers DNS directly — resolver role confirmed."
+    record PASS "Router as DNS resolver" "$ROUTER_IP resolved $EXTERNAL_HOST → $direct_answer"
+  else
+    warn "Router $ROUTER_IP did not answer DNS — check /ip dns allow-remote-requests=yes."
+    record WARN "Router as DNS resolver" "No DNS response from $ROUTER_IP directly"
+  fi
+
+  # Test 10c: DNS leak — confirm external resolver cannot be reached directly
+  log "Testing DNS leak (querying 8.8.8.8 directly should go via router redirect)..."
+  local via_google
+  via_google=$(dig +short +time=5 @"$EXTERNAL_IP" "$EXTERNAL_HOST" 2>/dev/null | head -1)
+  if [ -n "$via_google" ]; then
+    # With redirect active, querying @8.8.8.8 still works (router intercepts and answers)
+    # Without redirect, querying @8.8.8.8 works by reaching Google directly
+    # We can't easily distinguish; report as informational
+    warn "DNS to @$EXTERNAL_IP resolved '$via_google' — may be redirected (expected) or a direct leak."
+    warn "Confirm via MikroTik: /ip firewall nat print — look for rcn-dns-redirect rules."
+    record WARN "DNS leak check" "Query @$EXTERNAL_IP succeeded — verify NAT redirect is in place"
+  else
+    ok "Direct query to @$EXTERNAL_IP timed out — DNS redirect blocking external resolver access."
+    record PASS "DNS leak check" "Direct query @$EXTERNAL_IP failed — redirect is active"
+  fi
+}
+
+# ── TEST 11: HTTP Header Injection ───────────────────────────
+test_header_injection() {
+  header "TEST 11 — HTTP Header Injection (Portal Identity Bypass)"
+
+  local portal_url="https://${PORTAL_DOMAIN}"
+
+  # Test 11a: X-Forwarded-For spoofing — portal must return same content regardless
+  log "Testing X-Forwarded-For / X-Real-IP spoofing..."
+  local normal_code spoofed_code
+  normal_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" \
+    "$portal_url" 2>/dev/null)
+  spoofed_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" \
+    -H "X-Forwarded-For: 127.0.0.1" \
+    -H "X-Real-IP: 127.0.0.1" \
+    -H "X-Originating-IP: 127.0.0.1" \
+    -H "CF-Connecting-IP: 127.0.0.1" \
+    "$portal_url" 2>/dev/null)
+
+  if [ "$normal_code" = "$spoofed_code" ]; then
+    ok "Portal returns HTTP $normal_code with or without spoofed IP headers — not trusting XFF."
+    record PASS "X-Forwarded-For ignored" "Same HTTP $normal_code with/without spoofed XFF headers"
+  else
+    fail "Portal response changed: normal=$normal_code, spoofed=$spoofed_code"
+    fail "Portal may trust X-Forwarded-For for auth — IP spoofing bypass possible!"
+    record FAIL "X-Forwarded-For ignored" "Response: $normal_code → $spoofed_code with spoofed XFF"
+  fi
+
+  # Test 11b: HTTP CONNECT method — portal must NOT act as a forward proxy
+  log "Testing HTTP CONNECT method (portal must not proxy external requests)..."
+  local connect_code
+  connect_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" \
+    -X CONNECT \
+    -H "Host: google.com:443" \
+    "$portal_url" 2>/dev/null)
+
+  if [ "$connect_code" = "200" ]; then
+    fail "Portal returned HTTP 200 to CONNECT method — may be acting as open HTTP proxy!"
+    record FAIL "CONNECT proxy blocked" "Portal returned 200 to CONNECT method — proxy bypass risk"
+  elif [[ "$connect_code" =~ ^(400|403|405|501|000)$ ]]; then
+    ok "Portal rejected CONNECT method (HTTP $connect_code) — not a proxy."
+    record PASS "CONNECT proxy blocked" "Portal returned HTTP $connect_code to CONNECT method"
+  else
+    warn "CONNECT method returned HTTP $connect_code — verify manually."
+    record WARN "CONNECT proxy blocked" "CONNECT → HTTP $connect_code"
+  fi
+
+  # Test 11c: Spoofed Origin / Referer — check portal isn't doing naive origin checks
+  log "Testing spoofed Origin header (portal must validate sessions, not headers)..."
+  local origin_code
+  origin_code=$(curl -s --max-time "$TIMEOUT" -o /dev/null -w "%{http_code}" \
+    -H "Origin: https://${PORTAL_DOMAIN}" \
+    -H "Referer: https://${PORTAL_DOMAIN}/login" \
+    "${portal_url}/api/usage" 2>/dev/null)
+
+  if [[ "$origin_code" =~ ^(401|403|302)$ ]]; then
+    ok "API with spoofed Origin returned HTTP $origin_code — session token still required."
+    record PASS "Origin header ignored" "API returned HTTP $origin_code — origin spoofing blocked"
+  elif [ "$origin_code" = "200" ]; then
+    warn "API returned 200 with spoofed Origin — confirm this endpoint requires a valid session token."
+    record WARN "Origin header ignored" "API returned 200 with spoofed Origin — verify session enforcement"
+  else
+    warn "API with spoofed Origin: HTTP $origin_code — inconclusive."
+    record WARN "Origin header ignored" "HTTP $origin_code — check manually"
+  fi
+}
+
+# ── TEST 12: NTP Tunnel Bypass ────────────────────────────────
+test_ntp_bypass() {
+  header "TEST 12 — NTP Tunnel Bypass (UDP port 123)"
+  log "NTP (UDP 123) should only reach the router's own clock — not the full internet..."
+
+  # ── Method A: Python (most reliable) ────────────────────────
+  if command -v python3 &>/dev/null; then
+    log "Sending real NTP client requests to external time servers..."
+    local ntp_result
+    ntp_result=$(python3 -c "
+import socket
+
+ntp_msg = b'\\x1b' + b'\\x00' * 47  # NTP mode 3 (client) request
+
+targets = [
+    ('216.239.35.0',   'time.google.com'),
+    ('162.159.200.1',  'time.cloudflare.com'),
+    ('129.6.15.28',    'time.nist.gov'),
+]
+
+reachable = []
+for ip, name in targets:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(5)
+    try:
+        s.sendto(ntp_msg, (ip, 123))
+        data, _ = s.recvfrom(1024)
+        if len(data) >= 48:
+            reachable.append(name)
+    except:
+        pass
+    finally:
+        s.close()
+
+print('REACHABLE:' + ','.join(reachable) if reachable else 'BLOCKED')
+" 2>/dev/null)
+
+    if echo "$ntp_result" | grep -q "^REACHABLE:"; then
+      local reached; reached=$(echo "$ntp_result" | cut -d: -f2)
+      fail "NTP reached external servers: $reached"
+      fail "UDP 123 is open to internet — usable as a low-bandwidth covert channel."
+      warn "Fix: in MikroTik, add a forward/drop rule for UDP dst-port=123 from hotspot clients."
+      record FAIL "NTP tunnel blocked" "UDP 123 reached: $reached — NTP bypass possible"
+    else
+      ok "All external NTP servers unreachable — UDP 123 is blocked to internet."
+      record PASS "NTP tunnel blocked" "UDP 123 to all test NTP servers timed out"
+    fi
+    return
+  fi
+
+  # ── Method B: nc fallback ────────────────────────────────────
+  if command -v nc &>/dev/null; then
+    log "Testing NTP via netcat (UDP 123 → 216.239.35.0)..."
+    printf '\x1b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00' \
+      | nc -u -w 5 216.239.35.0 123 > /tmp/ntp_probe.bin 2>/dev/null || true
+    local ntp_bytes; ntp_bytes=$(wc -c < /tmp/ntp_probe.bin 2>/dev/null || echo 0)
+    rm -f /tmp/ntp_probe.bin
+
+    if [ "$ntp_bytes" -ge 48 ]; then
+      fail "NTP probe received $ntp_bytes bytes — UDP 123 is open to internet!"
+      record FAIL "NTP tunnel blocked" "nc UDP 123 got $ntp_bytes bytes — NTP bypass possible"
+    else
+      ok "NTP probe got no response — UDP 123 appears blocked."
+      record PASS "NTP tunnel blocked" "nc UDP 123 to 216.239.35.0 got no response"
+    fi
+    return
+  fi
+
+  skip "python3 and nc not available — skipping NTP test."
+  record SKIP "NTP tunnel blocked" "No suitable tool available"
+}
+
 # ── Install check ─────────────────────────────────────────────
 check_tools() {
   header "Checking Required Tools"
@@ -543,6 +821,8 @@ check_tools() {
   check_tool "iodine"  "iodine"          || true
   check_tool "nc"      "netcat-openbsd"  || true
   check_tool "python3" "python3"         || true
+  check_tool "hping3"  "hping3"          || true
+  check_tool "nmap"    "nmap"            || true
 
   install_tools
 }
@@ -598,7 +878,7 @@ main() {
   clear
   echo ""
   echo -e "${BOLD}${BLUE}  ╔══════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}${BLUE}  ║   RuralConnect Bypass Test Suite v1.0        ║${NC}"
+  echo -e "${BOLD}${BLUE}  ║   RuralConnect Bypass Test Suite v2.0        ║${NC}"
   echo -e "${BOLD}${BLUE}  ║   Connect to hotspot (unauthenticated) first  ║${NC}"
   echo -e "${BOLD}${BLUE}  ╚══════════════════════════════════════════════╝${NC}"
   echo ""
@@ -618,6 +898,10 @@ main() {
   test_dns_tunnel
   test_cf_walled_garden
   test_portal_integrity
+  test_stateful_firewall
+  test_dns_hijacking
+  test_header_injection
+  test_ntp_bypass
   print_summary
 }
 
