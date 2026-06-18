@@ -1209,7 +1209,7 @@ print_summary() {
   elif [ "$WARN" -gt 0 ]; then
     echo ""
     echo -e "${YELLOW}${BOLD}  ⚠ $WARN warning(s) — minor issues or known limitations.${NC}"
-    echo -e "  Most WARNs are expected (e.g. WebSocket-over-443 is unfixable)."
+    echo -e "  Review WARN entries — most are minor or platform limitations (e.g. Android ICMP needs root)."
   else
     echo ""
     echo -e "${GREEN}${BOLD}  ✔ All tests passed — captive portal hardening is working!${NC}"
